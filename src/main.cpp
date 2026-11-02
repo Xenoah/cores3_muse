@@ -10,6 +10,7 @@
 #include "AvatarFaceController.h"
 #include "Body.h"
 #include "CalibrationController.h"
+#include "CameraView.h"
 #include "Conversation.h"
 #include "MuseClient.h"
 #include "Recorder.h"
@@ -28,6 +29,7 @@ Speech speech;
 MuseClient muse;
 Conversation conversation;
 Recorder recorder;
+CameraView cameraView;
 
 // --- 見守り ---------------------------------------------------------------
 
@@ -74,6 +76,7 @@ enum class Phase : uint8_t {
   Transcribing,  // 聞き取った音声を文字にしている
   Thinking,    // Muse が考えている
   Speaking,    // 話している
+  Preview,     // カメラのプレビュー
 };
 
 struct PhaseStyle {
@@ -104,12 +107,15 @@ PhaseStyle styleOf(Phase phase) {
     case Phase::Transcribing: return {"聞き取り中", true, kThinkPurple, kWhite, 24, 0, 40};
     case Phase::Thinking:   return {"考え中", true, kThinkPurple, kWhite, 24, 0, 40};
     case Phase::Speaking:   return {"話しています", false, kSpeakNavy, kWhite, 0, 0, 48};
+    case Phase::Preview:    return {"カメラ", false, kBlack, kWhite, 48, 48, 48};
   }
   return {"", false, kBlack, kWhite, 0, 0, 0};
 }
 
 Phase phase = Phase::Connecting;
 uint32_t lastHudAt = 0;
+bool cameraFailed = false;
+PhotoPtr pendingPhoto;  // 次の質問に添える写真
 
 // モデル ID を画面用の名前にする（muse-spark-1.3 → Muse Spark 1.3）
 String modelLabel(const String& model) {
@@ -143,6 +149,8 @@ void refreshHud() {
   strlcpy(data.label, modelLabel(settings.model).c_str(), sizeof(data.label));
   data.wifiBars = settings.wifiSsid.isEmpty() ? -1 : wifiBars();
   data.buttons = phase == Phase::Ready;
+  data.cameraButton = !cameraFailed;
+  data.photo = pendingPhoto != nullptr;
   data.meter = phase == Phase::Listening;
   avatarFace.hud().set(data);
   lastHudAt = millis();
@@ -273,6 +281,7 @@ constexpr uint32_t kFollowUpTimeoutMs = 6000;     // 返事のあと、続けて
 // タップしたら小さな声も拾う。自動で聞くときは、テレビや物音で録音を始めないようにする
 constexpr float kTapMinLevel = 110.0f;
 constexpr float kFollowUpMinLevel = 220.0f;
+constexpr char kPhotoQuestion[] = "この写真に何が写っているか教えて";
 
 bool audioIsMic = false;
 bool followUpTurn = false;
@@ -308,6 +317,7 @@ void useMic() {
 }
 
 void backToReady() {
+  pendingPhoto.reset();
   useSpeaker();
   setPhase(Phase::Ready);
   body.setPose(Body::Pose::Idle);
@@ -373,6 +383,89 @@ void speakSentence(const String& text, Mood mood) {
   speech.say(text);
 }
 
+// 言葉から「見て」と頼まれたかどうかを判断する
+bool wantsCamera(const String& text) {
+  static const char* const kWords[] = {
+      "見て", "見える", "見せ", "みて", "みえる", "みせ", "写真", "カメラ", "これ何", "これなに",
+      "何これ", "なにこれ", "これは何", "これはなに", "look", "see this", "camera", "photo",
+      "picture", "what is this"};
+  String lower = text;
+  lower.toLowerCase();
+  for (const char* word : kWords) {
+    if (lower.indexOf(word) >= 0) return true;
+  }
+  return false;
+}
+
+// 頼まれたらその場で撮る。LED を白くして撮っていることを知らせる
+PhotoPtr lookNow() {
+  if (cameraFailed) return nullptr;
+  body.setPose(Body::Pose::Listen);  // 首を止めてぶれを防ぐ
+  M5StackChan.showRgbColor(96, 96, 96);
+  delay(150);
+  PhotoPtr photo;
+  if (cameraView.begin()) {
+    photo = cameraView.capture(true);
+    cameraView.end();
+  } else {
+    cameraFailed = true;
+  }
+  const PhaseStyle style = styleOf(phase);
+  M5StackChan.showRgbColor(style.r, style.g, style.b);
+  body.setPose(Body::Pose::Think);
+  return photo;
+}
+
+void askMuse(const String& text, PhotoPtr photo) {
+  setPhase(Phase::Thinking);
+  body.setPose(Body::Pose::Think);
+  avatarFace.showCaption(text, 0);
+  conversation.submitText(text, std::move(photo));
+}
+
+void openPreview(bool testPattern) {
+  if (!testPattern && !cameraView.begin()) {
+    cameraFailed = true;
+    refreshHud();
+    avatarFace.showCaption("カメラが使えませんでした", 4000);
+    return;
+  }
+  avatarFace.pauseDrawing();
+  if (!cameraView.openPreview(testPattern)) {
+    avatarFace.resumeDrawing();
+    avatarFace.showCaption("メモリが足りません", 4000);
+    return;
+  }
+  avatarFace.hud().clearCaption();
+  setPhase(Phase::Preview);
+  body.setPose(Body::Pose::Listen);
+}
+
+void closePreview() {
+  cameraView.closePreview();
+  cameraView.end();
+  avatarFace.resumeDrawing();
+}
+
+void handlePreviewTap(int16_t x, int16_t y) {
+  const bool closing = x >= 0 && x < kPreviewCloseSize && y >= 0 && y < kPreviewCloseSize;
+  if (!closing) {
+    pendingPhoto = cameraView.capture(false);
+    if (pendingPhoto == nullptr) {
+      closePreview();
+      backToReady();
+      avatarFace.showCaption("うまく撮れませんでした", 3000);
+      return;
+    }
+  }
+  closePreview();
+  if (closing) {
+    backToReady();
+    return;
+  }
+  startListening(false);
+}
+
 void updateConversation() {
   if (phase == Phase::Listening) {
     switch (recorder.state()) {
@@ -386,6 +479,11 @@ void updateConversation() {
                                  Recorder::kSampleRate);
         break;
       case Recorder::State::NoSpeech:
+        useSpeaker();
+        if (pendingPhoto != nullptr) {
+          askMuse(kPhotoQuestion, std::move(pendingPhoto));
+          break;
+        }
         backToReady();
         if (!followUpTurn) avatarFace.showCaption("聞こえなかったよ。もう一度タップしてね", 3000);
         break;
@@ -405,10 +503,21 @@ void updateConversation() {
       break;
     case ConversationEvent::Type::Transcript:
       Serial.printf("[conv] user: %s\n", event->text.c_str());
-      setPhase(Phase::Thinking);
       avatarFace.showCaption(event->text, 0);
+      {
+        PhotoPtr photo = std::move(pendingPhoto);
+        if (photo == nullptr && wantsCamera(event->text)) {
+          setPhase(Phase::Thinking);
+          photo = lookNow();
+        }
+        askMuse(event->text, std::move(photo));
+      }
       break;
     case ConversationEvent::Type::NoSpeech:
+      if (pendingPhoto != nullptr) {
+        askMuse(kPhotoQuestion, std::move(pendingPhoto));
+        break;
+      }
       backToReady();
       avatarFace.hud().clearCaption();
       if (!followUpTurn) avatarFace.showCaption("聞き取れなかったよ。もう一度タップしてね", 3000);
@@ -462,7 +571,14 @@ void handleTap() {
   tapPending = false;
   switch (phase) {
     case Phase::Ready:
-      startListening(false);
+      if (!cameraFailed && kHudCameraButton.contains(tapX, tapY)) {
+        openPreview(false);
+      } else {
+        startListening(false);
+      }
+      break;
+    case Phase::Preview:
+      handlePreviewTap(tapX, tapY);
       break;
     case Phase::Listening:
       recorder.finish();  // 話し終わりをタップで伝える
@@ -507,6 +623,9 @@ void printStatus() {
   doc["servo_calibrated"] = calibrationController.data().servoValid;
   doc["body_running"] = body.isRunning();
   doc["auto_listen"] = settings.autoListen;
+  doc["camera_ready"] = cameraView.isReady();
+  doc["camera_failed"] = cameraFailed;
+  doc["i2c_touch_ok"] = M5.In_I2C.scanID(0x38);
   doc["mic_noise"] = recorder.noiseFloor();
   doc["mic_peak"] = recorder.peakRms();
   doc["mic_gain"] = recorder.gain();
@@ -627,8 +746,27 @@ void handleCommand(const String& line) {
     recheckApi();
     Serial.println("#OK");
   } else if (command == "listen") {
+    tapX = -1;
+    tapY = -1;
     tapPending = true;
     Serial.println("#OK");
+  } else if (command == "tap") {
+    // 試験用に画面のタップを再現する: tap <x> <y>
+    const int comma = argument.indexOf(' ');
+    tapX = argument.substring(0, comma).toInt();
+    tapY = argument.substring(comma + 1).toInt();
+    tapPending = true;
+    Serial.println("#OK");
+  } else if (command == "preview") {
+    // "preview test" は映像の代わりに模様を出す
+    openPreview(argument == "test");
+    Serial.println("#OK");
+  } else if (command == "photo") {
+    // 撮って大きさだけ報告する。写真そのものは出さない
+    const PhotoPtr photo = cameraView.begin() ? cameraView.capture(true) : nullptr;
+    cameraView.end();
+    Serial.printf("#OK photo=%u ms=%u\n", photo ? static_cast<unsigned>(photo->bytes) : 0,
+                  static_cast<unsigned>(cameraView.captureMs()));
   } else if (command == "ask") {
     // 聞き取ったことにして Muse に尋ねる（マイクを使わない試験用）
     if (phase != Phase::Ready && phase != Phase::Speaking) {
@@ -641,7 +779,7 @@ void handleCommand(const String& line) {
     setPhase(Phase::Thinking);
     body.setPose(Body::Pose::Think);
     avatarFace.showCaption(argument, 0);
-    conversation.submitText(argument);
+    conversation.submitText(argument, wantsCamera(argument) ? lookNow() : nullptr);
     Serial.println("#OK");
   } else if (command == "forget") {
     conversation.forget();
@@ -781,6 +919,10 @@ void loop() {
   handleTap();
   loopStage = 13;
   updateConversation();
+  if (phase == Phase::Preview) {
+    loopStage = 15;
+    cameraView.drawPreview();
+  }
   loopStage = 14;
   delay(5);
 }

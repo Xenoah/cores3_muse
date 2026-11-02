@@ -7,6 +7,7 @@
 
 #include <deque>
 
+#include "CameraView.h"
 #include "MuseClient.h"
 #include "ReplySplitter.h"
 #include "Settings.h"
@@ -37,7 +38,8 @@ class Conversation {
 
   void checkApi();
   void submitAudio(const int16_t* pcm, size_t samples, uint32_t sampleRate);
-  void submitText(const String& text);
+  // 文を Muse に尋ねる。photo を付けると写真も見せる
+  void submitText(const String& text, PhotoPtr photo = nullptr);
 
   // 進行中の処理と届いていない知らせを捨てる
   void cancel();
@@ -56,6 +58,7 @@ class Conversation {
     size_t samples = 0;
     uint32_t sampleRate = 0;
     String text;
+    PhotoPtr photo;
   };
   struct Turn {
     String user;
@@ -66,8 +69,8 @@ class Conversation {
   void run();
   void submit(const Job& job);
   void process(const Job& job);
-  void ask(const Job& job, const String& userText);
-  String buildRequest(const String& userText) const;
+  void ask(const Job& job);
+  String buildRequest(const Job& job) const;
   void post(ConversationEvent::Type type, uint32_t generation, const String& text = String(),
             Mood mood = Mood::Neutral, const MuseResult* result = nullptr);
 

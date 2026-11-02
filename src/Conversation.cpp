@@ -1,6 +1,7 @@
 #include "Conversation.h"
 
 #include <ArduinoJson.h>
+#include <mbedtls/base64.h>
 #include <time.h>
 
 namespace {
@@ -18,7 +19,27 @@ constexpr char kSystemPrompt[] =
     "・声で読み上げるので、Markdown、箇条書き、記号、絵文字、URLは使いません。\n"
     "・最初に今の気持ちを [happy] [sad] [angry] [doubt] [sleepy] [neutral] のどれか1つで書き、"
     "続けて話します。\n"
-    "・聞き取りの誤りがありそうなときは文脈から考え、どうしても分からなければ聞き返します。\n";
+    "・聞き取りの誤りがありそうなときは文脈から考え、どうしても分からなければ聞き返します。\n"
+    "・写真が付いているときは、あなたのカメラで今撮った写真です。見えるものをもとに答えます。"
+    "写真が付いていないのに見えているふりはしません。\n";
+
+// 写真を data URL にする
+String photoDataUrl(const Photo& photo) {
+  constexpr char kPrefix[] = "data:image/jpeg;base64,";
+  const size_t capacity = (photo.bytes / 3 + 1) * 4 + 1;
+  auto* encoded = static_cast<unsigned char*>(
+      heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (encoded == nullptr) return String();
+  size_t written = 0;
+  mbedtls_base64_encode(encoded, capacity, &written, photo.jpeg, photo.bytes);
+  encoded[written] = 0;
+  String url;
+  url.reserve(sizeof(kPrefix) + written);
+  url += kPrefix;
+  url += reinterpret_cast<const char*>(encoded);
+  heap_caps_free(encoded);
+  return url;
+}
 
 String currentTimeText() {
   const time_t now = time(nullptr);
@@ -66,10 +87,11 @@ void Conversation::submitAudio(const int16_t* pcm, size_t samples, uint32_t samp
   submit(job);
 }
 
-void Conversation::submitText(const String& text) {
+void Conversation::submitText(const String& text, PhotoPtr photo) {
   Job job;
   job.type = JobType::Text;
   job.text = text;
+  job.photo = std::move(photo);
   submit(job);
 }
 
@@ -77,6 +99,7 @@ void Conversation::cancel() {
   xSemaphoreTake(lock_, portMAX_DELAY);
   ++generation_;
   pending_.type = JobType::None;
+  pending_.photo.reset();
   xSemaphoreGive(lock_);
   muse_->cancel();
   // 古い知らせはここで捨てる。処理中のタスクが後から送るものは generation で見分ける
@@ -121,6 +144,7 @@ void Conversation::run() {
       xSemaphoreTake(lock_, portMAX_DELAY);
       const Job job = pending_;
       pending_.type = JobType::None;
+      pending_.photo.reset();
       muse_->clearCancel();
       xSemaphoreGive(lock_);
       if (job.type == JobType::None) break;
@@ -147,7 +171,7 @@ void Conversation::process(const Job& job) {
   }
 
   if (job.type == JobType::Text) {
-    ask(job, job.text);
+    ask(job);
     return;
   }
 
@@ -168,11 +192,11 @@ void Conversation::process(const Job& job) {
     post(ConversationEvent::Type::NoSpeech, job.generation);
     return;
   }
+  // 写真を添えるかどうかはメインループが決めて submitText() する
   post(ConversationEvent::Type::Transcript, job.generation, transcript);
-  ask(job, transcript);
 }
 
-String Conversation::buildRequest(const String& userText) const {
+String Conversation::buildRequest(const Job& job) const {
   JsonDocument doc;
   doc["model"] = settings_->model;
   doc["reasoning_effort"] = settings_->reasoning;
@@ -192,13 +216,23 @@ String Conversation::buildRequest(const String& userText) const {
   }
   JsonObject user = messages.add<JsonObject>();
   user["role"] = "user";
-  user["content"] = userText;
+  if (job.photo != nullptr) {
+    JsonArray content = user["content"].to<JsonArray>();
+    JsonObject text = content.add<JsonObject>();
+    text["type"] = "text";
+    text["text"] = job.text;
+    JsonObject image = content.add<JsonObject>();
+    image["type"] = "image_url";
+    image["image_url"]["url"] = photoDataUrl(*job.photo);
+  } else {
+    user["content"] = job.text;
+  }
   String body;
   serializeJson(doc, body);
   return body;
 }
 
-void Conversation::ask(const Job& job, const String& userText) {
+void Conversation::ask(const Job& job) {
   const uint32_t started = millis();
   uint32_t firstTextAt = 0;
   String spoken;
@@ -206,7 +240,7 @@ void Conversation::ask(const Job& job, const String& userText) {
     spoken += sentence.c_str();
     post(ConversationEvent::Type::Sentence, job.generation, sentence.c_str(), mood);
   });
-  const MuseResult result = muse_->chat(buildRequest(userText), [&](const char* delta) {
+  const MuseResult result = muse_->chat(buildRequest(job), [&](const char* delta) {
     if (firstTextAt == 0) firstTextAt = millis();
     splitter.feed(delta);
   });
@@ -222,7 +256,8 @@ void Conversation::ask(const Job& job, const String& userText) {
     return;
   }
   if (!spoken.isEmpty()) {
-    history_.push_back({userText, spoken});
+    // 写真そのものは覚えない。次の質問では見せたことだけを伝える
+    history_.push_back({job.photo != nullptr ? job.text + "（写真を見せた）" : job.text, spoken});
     while (history_.size() > kMaxTurns) history_.pop_front();
   }
   post(ConversationEvent::Type::Done, job.generation);

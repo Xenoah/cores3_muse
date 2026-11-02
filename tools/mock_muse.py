@@ -69,6 +69,23 @@ def analyze(samples, rate: int) -> None:
            peaks_hz=[round(float(freqs[i])) for i in peaks])
 
 
+def image_stats(data: bytes) -> dict:
+    """Numbers about a JPEG, so a camera can be checked without anyone looking at the photo."""
+    try:
+        from PIL import Image, ImageStat
+    except ImportError:
+        return {}
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    stat = ImageStat.Stat(image)
+    gray = image.convert("L")
+    pixels = gray.tobytes()
+    width = gray.width
+    step = sum(abs(pixels[i] - pixels[i + 1]) for i in range(len(pixels) - 1)
+               if (i + 1) % width) / max(len(pixels) - gray.height, 1)
+    return {"mean_rgb": [round(v) for v in stat.mean], "std_rgb": [round(v) for v in stat.stddev],
+            "mean_step": round(step, 1)}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -164,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     data = base64.b64decode(url[len(prefix):], validate=True)
                     images.append({"bytes": len(data), "size": jpeg_size(data),
-                                   "role": message["role"]})
+                                   "role": message["role"], **image_stats(data)})
                     if ARGS.save_image:
                         with open(ARGS.save_image, "wb") as out:
                             out.write(data)

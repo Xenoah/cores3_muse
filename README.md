@@ -2,7 +2,7 @@
 
 M5Stack CoreS3 のスタックチャンで、Meta の [Muse](https://dev.meta.ai/) と話すためのファームウェアです。
 
-![話しているところ](docs/screenshots/v0.2.0/speaking.png)
+![話しているところ](docs/screenshots/v0.3.0/speaking-photo.png)
 
 > **開発中です。** 進み具合は [CHANGELOG.md](CHANGELOG.md) を見てください。
 > 実際の Muse の応答での確認は、API キーが用意できてからになります。
@@ -15,9 +15,20 @@ M5Stack CoreS3 のスタックチャンで、Meta の [Muse](https://dev.meta.ai
 
 話している途中でタップすると、割り込んで話せます。考えている途中でタップすると取り消します。
 
-| 待機中 | 聞いています | 考え中 | 話しています |
+### 見せて話す
+
+- **「見せて」ボタン**: カメラの映像が出ます。タップで撮って、そのまま話しかけてください。
+  何も言わなければ「この写真に何が写っているか教えて」と尋ねます
+- **声で頼む**: 「これ見て」「何が見える？」「写真撮って」のように言うと、その場で撮って Muse に見せます。
+  撮るときは本体の LED が白く光ります
+
+| 待機中 | 聞いています（写真つき） | 考え中 | 話しています |
 | --- | --- | --- | --- |
-| ![待機中](docs/screenshots/v0.2.0/idle.png) | ![聞いています](docs/screenshots/v0.2.0/listening.png) | ![考え中](docs/screenshots/v0.2.0/thinking.png) | ![話しています](docs/screenshots/v0.2.0/speaking.png) |
+| ![待機中](docs/screenshots/v0.3.0/idle-after-camera.png) | ![聞いています](docs/screenshots/v0.3.0/listening-with-photo.png) | ![考え中](docs/screenshots/v0.3.0/thinking-photo.png) | ![話しています](docs/screenshots/v0.3.0/speaking-photo.png) |
+
+カメラのプレビューは下のような画面です。公開用の画像は映像の代わりにテストパターンを出しています。
+
+![カメラのプレビュー](docs/screenshots/v0.3.0/camera-preview-test-pattern.png)
 
 ## できること
 
@@ -31,7 +42,7 @@ M5Stack CoreS3 のスタックチャンで、Meta の [Muse](https://dev.meta.ai
 | 声で話しかける | マイク → Muse Voice Transcribe | ✅ |
 | Muse と会話 | Muse Spark（Chat Completions、ストリーミング） | ✅ |
 | 気持ちに合わせた表情と首の動き | 画面、サーボ | ✅ |
-| 見せて話す | カメラ → Muse Spark（画像入力） | 次の版 |
+| 見せて話す | カメラ → Muse Spark（画像入力） | ✅ |
 
 ### 声について
 
@@ -70,6 +81,7 @@ NVS は暗号化していないので、本体を人に渡すときは引数な�
 
 - マイクの音声は `muse-voice-transcribe-1.0` へ、会話の文字は `muse-spark-1.3` へ送ります。
   マイクは緑の「聞いています」の間だけ使います。音声は本体に残しません
+- カメラは撮るときだけ起動します。写真はその質問にだけ添えて `muse-spark-1.3` へ送り、本体にも会話の履歴にも残しません
 - 標準の `muse-spark-1.3` は、送った内容を Meta のモデルの学習に使いません。
   安価な `-contributor` のモデルは学習に使われるので、既定では使いません
 - 料金は [Meta の料金表](https://dev.meta.ai/docs/pricing-rate-limits)を見てください
@@ -86,7 +98,7 @@ NVS は暗号化していないので、本体を人に渡すときは引数な�
 
 USB シリアル（115200bps）で次のコマンドを受け付けます。
 
-`status` / `shot` / `listen` / `ask <文>` / `say <文>` / `forget` / `autolisten <0|1>` / `setkey <キー>` / `wifi <SSID><TAB><パスワード>` / `volume <0-255>` / `model <ID>` / `check` / `micstats` / `servo <0|1>` / `nod` / `joy` / `shake` / `calibrate` / `reboot`
+`status` / `shot` / `listen` / `tap <x> <y>` / `ask <文>` / `say <文>` / `preview [test]` / `photo` / `forget` / `autolisten <0|1>` / `setkey <キー>` / `wifi <SSID><TAB><パスワード>` / `volume <0-255>` / `model <ID>` / `check` / `micstats` / `servo <0|1>` / `nod` / `joy` / `shake` / `calibrate` / `reboot`
 
 `baseurl <URL>` はテスト用に接続先を差し替えます。保存はしないので、再起動すると `api.meta.ai` に戻ります。
 既定以外の接続先に本物のキーは送りません。
@@ -99,6 +111,7 @@ USB シリアル（115200bps）で次のコマンドを受け付けます。
 | [src/Conversation.cpp](src/Conversation.cpp) | 音声 → 文字 → 返事の流れ（専用タスク） |
 | [src/MuseClient.cpp](src/MuseClient.cpp) | Meta Model API のクライアント |
 | [src/Recorder.cpp](src/Recorder.cpp) | 録音、話し始めと話し終わりの判定 |
+| [src/CameraView.cpp](src/CameraView.cpp) | カメラ、プレビュー、JPEG |
 | [src/ReplySplitter.cpp](src/ReplySplitter.cpp) | 返事を文に切り分け、気持ちのタグと記号を処理 |
 | [src/FaceHud.cpp](src/FaceHud.cpp) | 顔に重ねる会話 UI |
 | [src/Body.cpp](src/Body.cpp) | 首の動き |
