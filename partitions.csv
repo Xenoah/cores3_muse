@@ -1,0 +1,10 @@
+# StackChan x Bambu: 16MB flash layout (keep this file ASCII-only; PlatformIO reads it with the system codepage)
+# nvs / otadata keep the default_16MB.csv offsets, so Wi-Fi settings and calibration survive the change.
+# app0 is 5.75MB (no OTA): firmware + embedded reading dictionaries (dict/ja.dic, dict/en.dic).
+# The rest is LittleFS (label "spiffs") for the built-in voice pack (phrases + morae).
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x5C0000,
+spiffs,   data, spiffs,   0x5D0000, 0xA20000,
+coredump, data, coredump, 0xFF0000, 0x10000,

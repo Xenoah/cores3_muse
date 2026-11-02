@@ -1,0 +1,11 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+
+# Full flash dumps contain Wi-Fi passwords and API keys. Never commit them.
+.backup/
+# Release assets are uploaded with gh, not committed.
+.release/
+# Generated with VOICEVOX (tools/make_voice_pack.py). Not redistributed here.
+data/voice.pak
