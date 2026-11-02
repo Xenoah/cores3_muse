@@ -89,6 +89,9 @@ bool MuseClient::open(const char* method, const char* path, const char* contentT
     return false;
   }
 
+  // 小さく分けて送るので、遅延 ACK と Nagle で待たされないようにする
+  client_->setNoDelay(true);
+
   // 本物のキーは既定の接続先にだけ送る
   const String key = isDefault ? apiKey_ : String("test-key");
   String head;

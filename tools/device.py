@@ -65,9 +65,16 @@ class Device:
         self.send(line)
         return self.wait_for("#", timeout)
 
-    def status(self, timeout: float = 5.0) -> dict:
-        self.send("status")
-        return json.loads(self.wait_for("#STATUS ", timeout)[len("#STATUS "):])
+    def status(self, timeout: float = 10.0) -> dict:
+        # The first command after opening the port can get lost, so ask again.
+        deadline = time.monotonic() + timeout
+        while True:
+            self.send("status")
+            try:
+                return json.loads(self.wait_for("#STATUS ", 2.5)[len("#STATUS "):])
+            except (TimeoutError, json.JSONDecodeError):  # or a log line got mixed in
+                if time.monotonic() >= deadline:
+                    raise
 
     def screenshot(self, retries: int = 3):
         """Read the real LCD contents. Returns (width, height, rgb888 bytes)."""

@@ -10,15 +10,15 @@ namespace {
 // 角度は 0.1 度単位、速度は 0.1 度/秒単位
 constexpr uint32_t kUpdateIntervalMs = 80;
 constexpr int kIdleSpeed = 160;        // 16.0度/秒
-constexpr int kGestureSpeed = 720;     // 72.0度/秒
+// 大音量の発話と重なると USB 給電では電流が足りず USB が切れることがあった（72度/秒で確認）
+constexpr int kGestureSpeed = 300;     // 30.0度/秒
 constexpr int kHomeYaw = 0;            // 正面
 constexpr int kHomePitch = 200;        // 20.0度上向き
-constexpr int kListenPitchOffset = 40; // 聞くときは 4.0 度だけ上を向く
 constexpr int kMaxStep = 24;           // 1更新あたり2.4度
 
-constexpr uint32_t kNodMs = 700;
+constexpr uint32_t kNodMs = 800;
 constexpr uint32_t kJoyMs = 2400;
-constexpr uint32_t kShakeMs = 1200;
+constexpr uint32_t kShakeMs = 1600;
 
 int moveToward(int current, int desired, int maxStep) {
   if (desired > current) return min(current + maxStep, desired);
@@ -77,6 +77,7 @@ void Body::setPose(Pose pose) {
   if (pose_ == pose) return;
   pose_ = pose;
   poseStartedAt_ = millis();
+  if (pose == Pose::Listen) gesture_ = Gesture::None;
 }
 
 void Body::startGesture(Gesture gesture) {
@@ -116,13 +117,13 @@ void Body::update() {
       int yaw = kHomeYaw;
       int pitch = kHomePitch;
       if (gesture_ == Gesture::Nod) {
-        pitch -= static_cast<int>(roundf(90.0f * envelope));
+        pitch -= static_cast<int>(roundf(60.0f * envelope));
       } else if (gesture_ == Gesture::Joy) {
-        yaw += static_cast<int>(roundf(180.0f * sinf(2.0f * PI * 2.0f * t) * envelope));
+        yaw += static_cast<int>(roundf(100.0f * sinf(2.0f * PI * 2.0f * t) * envelope));
       } else {
-        yaw += static_cast<int>(roundf(90.0f * sinf(2.0f * PI * 2.0f * t) * envelope));
+        yaw += static_cast<int>(roundf(60.0f * sinf(2.0f * PI * 2.0f * t) * envelope));
       }
-      moveTo(yaw, pitch, kGestureSpeed, 60);
+      moveTo(yaw, pitch, kGestureSpeed, 30);
       return;
     }
     gesture_ = Gesture::None;
@@ -137,7 +138,6 @@ void Body::update() {
              kIdleSpeed, kMaxStep);
       break;
     case Pose::Listen:
-      moveTo(kHomeYaw, kHomePitch + kListenPitchOffset, kIdleSpeed, kMaxStep);
       break;
     case Pose::Think:
       moveTo(kHomeYaw + static_cast<int>(roundf(90.0f * sinf(elapsed * 0.9f))),

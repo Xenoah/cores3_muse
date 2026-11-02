@@ -12,7 +12,8 @@ struct HudData {
   char label[28] = "";     // 右上のラベル（モデル名）
   int8_t wifiBars = -1;    // Wi-Fi の強さ 0〜3（-1 = 非表示）
   bool photo = false;      // 写真を添付している
-  bool buttons = false;    // 下段に「話す」「見せて」を出す
+  bool buttons = false;    // 下段に「話す」を出す
+  bool cameraButton = false;  // 「見せて」も並べる
   bool meter = false;      // 下段に入力音量のメーターを出す
 };
 
@@ -24,6 +25,7 @@ struct HudRect {
   }
 };
 constexpr HudRect kHudTalkButton = {6, 200, 196, 36};
+constexpr HudRect kHudTalkButtonWide = {6, 200, 308, 36};  // カメラが使えないとき
 constexpr HudRect kHudCameraButton = {208, 200, 106, 36};
 
 // 顔スプライトに会話 UI を描く。
@@ -57,7 +59,7 @@ class FaceHud {
 
   void drawTopBar(M5Canvas* c, const HudData& d, uint16_t fg, uint16_t bg,
                   uint32_t now);
-  void drawButtons(M5Canvas* c, uint16_t fg, uint16_t bg);
+  void drawButtons(M5Canvas* c, bool camera, uint16_t fg, uint16_t bg);
   void drawMeter(M5Canvas* c, const uint8_t* bars, int head, uint16_t fg);
   // UTF-8 テキストを幅 maxWidth で折り返して lines 行ぶん描く。
   // skipLines 行ぶんは描かずに読み飛ばす。戻り値は全行数。

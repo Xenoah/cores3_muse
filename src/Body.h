@@ -11,7 +11,7 @@ class Body {
  public:
   enum class Pose : uint8_t {
     Idle,   // ゆっくり揺れる
-    Listen, // 少し上を向いて止まる（モーター音をマイクに入れない）
+    Listen, // 止まる（モーター音をマイクに入れない）
     Think,  // ゆっくり左右を見る
     Speak,  // 小さく揺れる
   };

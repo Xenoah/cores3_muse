@@ -162,7 +162,7 @@ void FaceHud::draw(M5Canvas* canvas, int colorDepth, uint16_t fg,
   } else if (d.meter) {
     drawMeter(canvas, meter, meterHead, fg);
   } else if (d.buttons) {
-    drawButtons(canvas, fg, bg);
+    drawButtons(canvas, d.cameraButton, fg, bg);
   }
 
   if (toast[0] != '\0' && caption[0] == '\0') {
@@ -220,13 +220,14 @@ void FaceHud::drawTopBar(M5Canvas* c, const HudData& d, uint16_t fg,
   }
 }
 
-void FaceHud::drawButtons(M5Canvas* c, uint16_t fg, uint16_t bg) {
-  const HudRect talk = kHudTalkButton;
+void FaceHud::drawButtons(M5Canvas* c, bool withCamera, uint16_t fg, uint16_t bg) {
+  const HudRect talk = withCamera ? kHudTalkButton : kHudTalkButtonWide;
   c->fillRoundRect(talk.x, talk.y, talk.w, talk.h, 10, fg);
   drawMicIcon(c, talk.x + talk.w / 2 - 30, talk.y + talk.h / 2, bg);
   c->setTextColor(bg, fg);
   c->setTextDatum(middle_center);
   c->drawString("話す", talk.x + talk.w / 2 + 12, talk.y + talk.h / 2 + 1);
+  if (!withCamera) return;
 
   const HudRect camera = kHudCameraButton;
   c->fillRoundRect(camera.x, camera.y, camera.w, camera.h, 10, bg);

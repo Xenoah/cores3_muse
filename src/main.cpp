@@ -10,7 +10,9 @@
 #include "AvatarFaceController.h"
 #include "Body.h"
 #include "CalibrationController.h"
+#include "Conversation.h"
 #include "MuseClient.h"
+#include "Recorder.h"
 #include "ScreenShot.h"
 #include "Settings.h"
 #include "Speech.h"
@@ -24,6 +26,40 @@ Settings settings;
 Body body;
 Speech speech;
 MuseClient muse;
+Conversation conversation;
+Recorder recorder;
+
+// --- 見守り ---------------------------------------------------------------
+
+// メインループが止まったら、どこで止まったかを残して再起動する。
+// RTC_NOINIT は再起動しても消えないので、次の起動時に報告できる。
+constexpr uint32_t kWedgedAfterMs = 30000;
+constexpr uint32_t kWedgedMagic = 0x57454400;
+
+RTC_NOINIT_ATTR uint32_t wedgedRecord;
+uint32_t lastWedgedStage = 0;  // 前回止まった場所（0 = 止まっていない）
+volatile uint32_t loopBeat = 0;
+volatile uint8_t loopStage = 0;
+volatile bool watchdogPaused = false;  // 校正中は長く待つことがある
+
+void watchdogTask(void*) {
+  uint32_t lastBeat = 0;
+  uint32_t lastChange = millis();
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    const uint32_t now = millis();
+    if (loopBeat != lastBeat || watchdogPaused) {
+      lastBeat = loopBeat;
+      lastChange = now;
+    } else if (now - lastChange > kWedgedAfterMs) {
+      wedgedRecord = kWedgedMagic | loopStage;
+      Serial.printf("#WEDGED stage=%u\n", loopStage);
+      Serial.flush();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      esp_restart();
+    }
+  }
+}
 
 // --- 画面の状態 -----------------------------------------------------------
 
@@ -33,7 +69,11 @@ enum class Phase : uint8_t {
   NoKey,       // API キーが未設定
   BadKey,      // API キーが拒否された
   Offline,     // Muse に届かない
-  Ready,       // 使える
+  Ready,       // 待機中
+  Listening,   // 聞いている
+  Transcribing,  // 聞き取った音声を文字にしている
+  Thinking,    // Muse が考えている
+  Speaking,    // 話している
 };
 
 struct PhaseStyle {
@@ -48,6 +88,9 @@ constexpr uint16_t kBlack = 0x0000;
 constexpr uint16_t kWhite = 0xFFFF;
 constexpr uint16_t kAlertRed = 0x6000;
 constexpr uint16_t kConnectSlate = 0x1926;
+constexpr uint16_t kListenGreen = 0x0340;
+constexpr uint16_t kThinkPurple = 0x3009;
+constexpr uint16_t kSpeakNavy = 0x000F;
 
 PhaseStyle styleOf(Phase phase) {
   switch (phase) {
@@ -56,7 +99,11 @@ PhaseStyle styleOf(Phase phase) {
     case Phase::NoKey:      return {"APIキー未設定", false, kAlertRed, kWhite, 40, 16, 0};
     case Phase::BadKey:     return {"APIキー無効", false, kAlertRed, kWhite, 40, 0, 0};
     case Phase::Offline:    return {"Muse に届きません", false, kAlertRed, kWhite, 40, 0, 0};
-    case Phase::Ready:      return {"準備OK", false, kBlack, kWhite, 0, 12, 0};
+    case Phase::Ready:      return {"待機中", false, kBlack, kWhite, 0, 8, 0};
+    case Phase::Listening:  return {"聞いています", false, kListenGreen, kWhite, 0, 64, 0};
+    case Phase::Transcribing: return {"聞き取り中", true, kThinkPurple, kWhite, 24, 0, 40};
+    case Phase::Thinking:   return {"考え中", true, kThinkPurple, kWhite, 24, 0, 40};
+    case Phase::Speaking:   return {"話しています", false, kSpeakNavy, kWhite, 0, 0, 48};
   }
   return {"", false, kBlack, kWhite, 0, 0, 0};
 }
@@ -95,6 +142,8 @@ void refreshHud() {
   data.chipPulse = style.pulse;
   strlcpy(data.label, modelLabel(settings.model).c_str(), sizeof(data.label));
   data.wifiBars = settings.wifiSsid.isEmpty() ? -1 : wifiBars();
+  data.buttons = phase == Phase::Ready;
+  data.meter = phase == Phase::Listening;
   avatarFace.hud().set(data);
   lastHudAt = millis();
 }
@@ -131,13 +180,10 @@ constexpr time_t kValidTimeAfter = 1700000000;  // これより前なら時刻�
 uint32_t wifiStartedAt = 0;
 bool timeRequested = false;
 
-// API の確認は TLS の接続で数秒かかるので専用タスクで行う
-std::atomic<bool> apiCheckRunning{false};
-std::atomic<bool> apiCheckDone{false};
 MuseResult apiCheckResult;
-int apiModelCount = 0;
 uint32_t apiCheckAt = 0;
 bool apiChecked = false;
+bool apiCheckRunning = false;
 int apiLastStatus = -1;
 
 void startWifi() {
@@ -153,34 +199,22 @@ void startWifi() {
   wifiStartedAt = millis();
 }
 
-void apiCheckTask(void*) {
-  muse.clearCancel();
-  muse.setApiKey(settings.apiKey);
-  apiCheckResult = muse.listModels(&apiModelCount);
-  Serial.printf("[muse] check: status=%d ok=%d code=%s message=%s models=%d heap=%u\n",
-                apiCheckResult.status, apiCheckResult.ok, apiCheckResult.code.c_str(),
-                apiCheckResult.message.c_str(), apiModelCount,
-                static_cast<unsigned>(ESP.getFreeHeap()));
-  apiCheckDone = true;
-  apiCheckRunning = false;
-  vTaskDelete(nullptr);
-}
-
 void startApiCheck() {
-  if (apiCheckRunning.exchange(true)) return;
-  apiCheckDone = false;
-  // TLS のハンドシェイクは深いスタックを使う
-  xTaskCreatePinnedToCore(apiCheckTask, "apiCheck", 16384, nullptr, 1, nullptr, PRO_CPU_NUM);
+  if (apiCheckRunning) return;
+  apiCheckRunning = true;
+  conversation.checkApi();
 }
 
-void onApiChecked() {
+void onApiChecked(const MuseResult& result) {
+  apiCheckResult = result;
+  apiCheckRunning = false;
   apiChecked = true;
   apiCheckAt = millis();
   apiLastStatus = apiCheckResult.status;
   if (apiCheckResult.ok) {
     setPhase(Phase::Ready);
     avatarFace.setExpression(m5avatar::Expression::Happy);
-    avatarFace.showCaption("Muse につながりました", 4000);
+    avatarFace.showCaption("Muse につながりました。タップして話しかけてね", 5000);
     body.nod();
     speech.say("ミューズに、つながりました");
     avatarFace.setExpression(m5avatar::Expression::Neutral);
@@ -224,12 +258,226 @@ void updateNetwork() {
   }
   if (time(nullptr) < kValidTimeAfter) return;
 
-  if (apiCheckDone.exchange(false)) onApiChecked();
   if (!apiChecked) {
     startApiCheck();
   } else if (phase == Phase::Offline && now - apiCheckAt > kOfflineRetryMs) {
     startApiCheck();
     apiCheckAt = now;
+  }
+}
+
+// --- 会話 -----------------------------------------------------------------
+
+constexpr uint32_t kFirstListenTimeoutMs = 7000;  // タップしたあと話し始めるまで
+constexpr uint32_t kFollowUpTimeoutMs = 6000;     // 返事のあと、続けて話し始めるまで
+// タップしたら小さな声も拾う。自動で聞くときは、テレビや物音で録音を始めないようにする
+constexpr float kTapMinLevel = 110.0f;
+constexpr float kFollowUpMinLevel = 220.0f;
+
+bool audioIsMic = false;
+bool followUpTurn = false;
+bool spokeInTurn = false;
+bool moodShown = false;
+
+m5avatar::Expression expressionOf(Mood mood) {
+  switch (mood) {
+    case Mood::Happy:  return m5avatar::Expression::Happy;
+    case Mood::Sad:    return m5avatar::Expression::Sad;
+    case Mood::Angry:  return m5avatar::Expression::Angry;
+    case Mood::Doubt:  return m5avatar::Expression::Doubt;
+    case Mood::Sleepy: return m5avatar::Expression::Sleepy;
+    case Mood::Neutral: break;
+  }
+  return m5avatar::Expression::Neutral;
+}
+
+void useSpeaker() {
+  if (!audioIsMic) return;
+  M5.Mic.end();
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(settings.volume);
+  audioIsMic = false;
+}
+
+void useMic() {
+  if (audioIsMic) return;
+  M5.Speaker.stop();
+  M5.Speaker.end();
+  M5.Mic.begin();
+  audioIsMic = true;
+}
+
+void backToReady() {
+  useSpeaker();
+  setPhase(Phase::Ready);
+  body.setPose(Body::Pose::Idle);
+  avatarFace.setExpression(m5avatar::Expression::Neutral);
+}
+
+void startListening(bool followUp) {
+  conversation.cancel();
+  useSpeaker();
+  followUpTurn = followUp;
+  spokeInTurn = false;
+  moodShown = false;
+  avatarFace.hud().clearCaption();
+  avatarFace.setExpression(m5avatar::Expression::Neutral);
+  setPhase(Phase::Listening);
+  body.setPose(Body::Pose::Listen);
+  // マイクが開いたことを音で知らせる
+  M5.Speaker.tone(followUp ? 1600 : 1200, 80);
+  delay(110);
+  useMic();
+  recorder.start(followUp ? kFollowUpTimeoutMs : kFirstListenTimeoutMs,
+                 followUp ? kFollowUpMinLevel : kTapMinLevel);
+}
+
+// 失敗を画面と声で伝える
+void reportFailure(const MuseResult& result) {
+  backToReady();
+  String message;
+  if (result.status == 401) {
+    setPhase(Phase::BadKey);
+    message = "API キーが使えないみたい。キーを確かめてね";
+  } else if (result.status == 402 || result.status == 403) {
+    message = "Muse に断られちゃった。クレジットや利用できる地域を確かめてね";
+  } else if (result.status == 429) {
+    message = "いま混み合っているみたい。少し待ってからまた話しかけてね";
+  } else if (result.status == 0) {
+    message = "ネットワークにつながらないみたい";
+  } else {
+    message = "うまくいかなかったよ。もう一度話しかけてね";
+  }
+  avatarFace.setExpression(m5avatar::Expression::Sad);
+  avatarFace.showCaption(message, 0);
+  body.shake();
+  speech.say(message);
+  avatarFace.hud().setCaption(message, 6000);
+  if (phase == Phase::Ready) avatarFace.setExpression(m5avatar::Expression::Neutral);
+}
+
+void speakSentence(const String& text, Mood mood) {
+  if (phase != Phase::Speaking) {
+    setPhase(Phase::Speaking);
+    body.setPose(Body::Pose::Speak);
+  }
+  avatarFace.setExpression(expressionOf(mood));
+  avatarFace.showCaption(text, 0);
+  if (!moodShown) {
+    moodShown = true;
+    if (mood == Mood::Happy) body.joy();
+    else if (mood == Mood::Doubt) body.shake();
+    else body.nod();
+  }
+  spokeInTurn = true;
+  speech.say(text);
+}
+
+void updateConversation() {
+  if (phase == Phase::Listening) {
+    switch (recorder.state()) {
+      case Recorder::State::Recording:
+        break;
+      case Recorder::State::Finished:
+        useSpeaker();
+        setPhase(Phase::Transcribing);
+        body.setPose(Body::Pose::Think);
+        conversation.submitAudio(recorder.samples(), recorder.sampleCount(),
+                                 Recorder::kSampleRate);
+        break;
+      case Recorder::State::NoSpeech:
+        backToReady();
+        if (!followUpTurn) avatarFace.showCaption("聞こえなかったよ。もう一度タップしてね", 3000);
+        break;
+      default:
+        backToReady();
+        avatarFace.showCaption("マイクが使えませんでした", 4000);
+        break;
+    }
+    return;
+  }
+
+  ConversationEvent* event = conversation.nextEvent();
+  if (event == nullptr) return;
+  switch (event->type) {
+    case ConversationEvent::Type::ApiChecked:
+      onApiChecked(event->result);
+      break;
+    case ConversationEvent::Type::Transcript:
+      Serial.printf("[conv] user: %s\n", event->text.c_str());
+      setPhase(Phase::Thinking);
+      avatarFace.showCaption(event->text, 0);
+      break;
+    case ConversationEvent::Type::NoSpeech:
+      backToReady();
+      avatarFace.hud().clearCaption();
+      if (!followUpTurn) avatarFace.showCaption("聞き取れなかったよ。もう一度タップしてね", 3000);
+      break;
+    case ConversationEvent::Type::Sentence:
+      Serial.printf("[conv] muse: %s\n", event->text.c_str());
+      speakSentence(event->text, event->mood);
+      break;
+    case ConversationEvent::Type::Done:
+      if (spokeInTurn && settings.autoListen && phase == Phase::Speaking) {
+        startListening(true);
+      } else {
+        backToReady();
+        avatarFace.hud().clearCaption();
+      }
+      break;
+    case ConversationEvent::Type::Failed:
+      reportFailure(event->result);
+      break;
+  }
+  delete event;
+}
+
+// --- タッチ ---------------------------------------------------------------
+
+volatile bool tapPending = false;
+int16_t tapX = 0;
+int16_t tapY = 0;
+
+// 話している途中でも受け付ける（serviceApp から呼ばれる）
+void pollTouch() {
+  const auto touch = M5.Touch.getDetail();
+  bool tapped = false;
+  if (touch.wasClicked()) {
+    tapX = touch.x;
+    tapY = touch.y;
+    tapped = true;
+  }
+  if (M5StackChan.TouchSensor.wasSingleClicked()) {  // 頭をポンとたたいても同じ
+    tapX = -1;
+    tapY = -1;
+    tapped = true;
+  }
+  if (!tapped) return;
+  tapPending = true;
+  if (phase == Phase::Speaking) speech.abort();
+}
+
+void handleTap() {
+  if (!tapPending) return;
+  tapPending = false;
+  switch (phase) {
+    case Phase::Ready:
+      startListening(false);
+      break;
+    case Phase::Listening:
+      recorder.finish();  // 話し終わりをタップで伝える
+      break;
+    case Phase::Transcribing:
+    case Phase::Thinking:
+      conversation.cancel();
+      backToReady();
+      avatarFace.hud().clearCaption();
+      break;
+    case Phase::Speaking:
+      startListening(false);  // 割り込んで話す
+      break;
+    default:
+      break;
   }
 }
 
@@ -251,7 +499,6 @@ void printStatus() {
   doc["model"] = settings.model;
   doc["api_status"] = apiLastStatus;
   doc["api_code"] = apiCheckResult.code;
-  doc["api_models"] = apiModelCount;
   doc["base_url_override"] = !muse.baseUrlOverride().isEmpty();
   doc["voice_clips"] = speech.clipCount();
   doc["voice_any_text"] = speech.canReadAnything();
@@ -259,27 +506,72 @@ void printStatus() {
   doc["volume"] = settings.volume;
   doc["servo_calibrated"] = calibrationController.data().servoValid;
   doc["body_running"] = body.isRunning();
+  doc["auto_listen"] = settings.autoListen;
+  doc["mic_noise"] = recorder.noiseFloor();
+  doc["mic_peak"] = recorder.peakRms();
+  doc["mic_gain"] = recorder.gain();
+  doc["wedged_stage"] = lastWedgedStage;
   doc["heap"] = ESP.getFreeHeap();
   doc["heap_min"] = ESP.getMinFreeHeap();
   doc["psram"] = ESP.getFreePsram();
   doc["face_stack_free"] = avatarFace.drawStackFree();
-  Serial.print("#STATUS ");
-  serializeJson(doc, Serial);
-  Serial.println();
+  // 他のタスクのログと混ざらないよう、1 回の書き込みで出す
+  String json;
+  serializeJson(doc, json);
+  Serial.print("#STATUS " + json + "\n");
 }
 
 void recheckApi() {
   muse.setApiKey(settings.apiKey);
   apiChecked = false;
-  apiCheckDone = false;
+  apiCheckRunning = false;
+  conversation.cancel();
   setPhase(Phase::Connecting);
   avatarFace.hud().clearCaption();
 }
 
 void runCalibration() {
+  watchdogPaused = true;
   body.release();
   calibrationController.run(avatarFace);
   body.begin(calibrationController.data());
+  watchdogPaused = false;
+}
+
+// マイクの状態を測る（調整用）。音声は残さず、統計だけを出す
+void printMicStats() {
+  constexpr size_t kSamples = Recorder::kSampleRate;  // 1 秒
+  auto* samples = static_cast<int16_t*>(
+      heap_caps_malloc(kSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (samples == nullptr) {
+    Serial.println("#ERR no memory");
+    return;
+  }
+  useMic();
+  // 起動直後の過渡音を読み捨ててから測る
+  M5.Mic.record(samples, kSamples / 4, Recorder::kSampleRate);
+  while (M5.Mic.isRecording()) delay(1);
+  M5.Mic.record(samples, kSamples, Recorder::kSampleRate);
+  while (M5.Mic.isRecording()) delay(1);
+  useSpeaker();
+
+  int64_t sum = 0;
+  int64_t squares = 0;
+  int peak = 0;
+  uint32_t crossings = 0;
+  for (size_t i = 0; i < kSamples; ++i) {
+    sum += samples[i];
+    squares += static_cast<int32_t>(samples[i]) * samples[i];
+    peak = max(peak, abs(samples[i]));
+    if (i > 0 && (samples[i] >= 0) != (samples[i - 1] >= 0)) ++crossings;
+  }
+  const float mean = static_cast<float>(sum) / kSamples;
+  const float rms = sqrtf(max(0.0f, static_cast<float>(squares) / kSamples - mean * mean));
+  Serial.printf("#MIC rms=%.0f mean=%.0f peak=%d crossings_per_s=%u first=", rms, mean, peak,
+                static_cast<unsigned>(crossings));
+  for (size_t i = 0; i < 12; ++i) Serial.printf("%d,", samples[i + 2000]);
+  Serial.println();
+  heap_caps_free(samples);
 }
 
 void handleCommand(const String& line) {
@@ -334,8 +626,40 @@ void handleCommand(const String& line) {
     muse.setBaseUrlOverride(argument);
     recheckApi();
     Serial.println("#OK");
+  } else if (command == "listen") {
+    tapPending = true;
+    Serial.println("#OK");
+  } else if (command == "ask") {
+    // 聞き取ったことにして Muse に尋ねる（マイクを使わない試験用）
+    if (phase != Phase::Ready && phase != Phase::Speaking) {
+      Serial.println("#ERR busy");
+      return;
+    }
+    conversation.cancel();
+    spokeInTurn = false;
+    moodShown = false;
+    setPhase(Phase::Thinking);
+    body.setPose(Body::Pose::Think);
+    avatarFace.showCaption(argument, 0);
+    conversation.submitText(argument);
+    Serial.println("#OK");
+  } else if (command == "forget") {
+    conversation.forget();
+    Serial.println("#OK");
+  } else if (command == "autolisten") {
+    settings.saveAutoListen(argument != "0");
+    Serial.println("#OK");
   } else if (command == "check") {
     recheckApi();
+    Serial.println("#OK");
+  } else if (command == "micstats") {
+    printMicStats();
+  } else if (command == "servo") {
+    if (argument == "0") {
+      body.release();
+    } else {
+      body.begin(calibrationController.data());
+    }
     Serial.println("#OK");
   } else if (command == "nod") {
     body.nod();
@@ -377,20 +701,36 @@ void updateConsole() {
 
 // 音声の再生中にも画面・サーボを動かし続ける
 void serviceApp() {
+  ++loopBeat;
+  loopStage = 1;
   M5StackChan.update();
+  loopStage = 2;
+  pollTouch();
+  loopStage = 3;
   avatarFace.update();
+  loopStage = 4;
   updateLipSync();
+  loopStage = 5;
   body.update();
+  loopStage = 6;
   if (millis() - lastHudAt > 2000) refreshHud();
+  loopStage = 7;
 }
 
 }  // namespace
 
 void setup() {
+  Serial.setTxBufferSize(4096);  // スクリーンショットの送信で溢れないように
   Serial.begin(115200);
   delay(100);
   Serial.printf("\nStackChan x Muse %s, reset reason=%d\n", kAppVersion,
                 static_cast<int>(esp_reset_reason()));
+  if ((wedgedRecord & 0xFFFFFF00) == kWedgedMagic) {
+    lastWedgedStage = wedgedRecord & 0xFF;
+    Serial.printf("[watchdog] the last run stopped at stage %u\n",
+                  static_cast<unsigned>(lastWedgedStage));
+  }
+  wedgedRecord = 0;
 
   M5StackChan.begin();
   // 不意に動かないよう、サーボは準備ができるまで切っておく
@@ -421,14 +761,26 @@ void setup() {
   M5.Speaker.begin();
   M5.Speaker.setVolume(settings.volume);
   speech.begin(settings, setLipSyncLevel, serviceApp);
+  conversation.begin(muse, settings);
+  if (!recorder.begin([](uint8_t level) { avatarFace.hud().pushMeter(level); })) {
+    Serial.println("[mic] no memory for recording");
+  }
 
   body.begin(calibration);
   startWifi();
+  xTaskCreatePinnedToCore(watchdogTask, "watchdog", 3072, nullptr, 1, nullptr, PRO_CPU_NUM);
 }
 
 void loop() {
   serviceApp();
+  loopStage = 10;
   updateConsole();
+  loopStage = 11;
   updateNetwork();
+  loopStage = 12;
+  handleTap();
+  loopStage = 13;
+  updateConversation();
+  loopStage = 14;
   delay(5);
 }

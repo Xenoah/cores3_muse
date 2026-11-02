@@ -54,6 +54,21 @@ def jpeg_size(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+def analyze(samples, rate: int) -> None:
+    """Report where the energy is. For tuning the microphone; needs numpy."""
+    import numpy as np
+    data = np.array(samples, dtype=float)
+    spectrum = np.abs(np.fft.rfft(data * np.hanning(len(data))))
+    freqs = np.fft.rfftfreq(len(data), 1 / rate)
+    power = spectrum ** 2
+    bands = [(0, 100), (100, 300), (300, 1000), (1000, 3000), (3000, 8001)]
+    total = power.sum() or 1
+    peaks = sorted(np.argsort(spectrum)[-5:].tolist())
+    report("spectrum", bands={f"{lo}-{hi}Hz": round(float(power[(freqs >= lo) & (freqs < hi)].sum() / total), 3)
+                              for lo, hi in bands},
+           peaks_hz=[round(float(freqs[i])) for i in peaks])
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -114,6 +129,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(400, "invalid_request", str(exc))
             return
         samples = struct.unpack(f"<{len(frames) // 2}h", frames)
+        if ARGS.analyze:
+            analyze(samples, rate)
         rms = math.sqrt(sum(s * s for s in samples) / max(len(samples), 1))
         report("transcribe", settings=settings, seconds=round(len(samples) / rate, 2), rate=rate,
                rms=round(rms, 1), peak=max(map(abs, samples), default=0),
@@ -202,9 +219,12 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.3)
     parser.add_argument("--fail-transcribe", type=int)
     parser.add_argument("--fail-chat", type=int)
+    parser.add_argument("--analyze", action="store_true", help="report the audio spectrum")
     parser.add_argument("--save-image", help="save received JPEGs here (for local checks only)")
     ARGS = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
+    # On Windows the default SO_REUSEADDR lets a second server share the port silently.
+    ThreadingHTTPServer.allow_reuse_address = False
     server = ThreadingHTTPServer(("0.0.0.0", ARGS.port), Handler)
     print(f"mock Muse on :{ARGS.port}", flush=True)
     server.serve_forever()
